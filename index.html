@@ -213,10 +213,10 @@
   }
 
   // ---------- notifications ----------
-  let lastAnnounced = null;
+  // Only the tab whose action calls a number reaches this (via advanceIfFree), once per call,
+  // so no per-tab "already announced" memory is needed. Such memory went stale after a reset
+  // made in another tab and silenced the next #001.
   function announce(t) {
-    if (lastAnnounced === t.num) return;
-    lastAnnounced = t.num;
     chime();
     const msg = `Number ${t.num}${t.name ? ' (' + t.name + ')' : ''}, you may now proceed to the massage chair.`;
     if ('Notification' in window && Notification.permission === 'granted') {
@@ -389,7 +389,7 @@
     syncNotify();
   };
   $('resetBtn').onclick = () => {
-    if (confirm('Clear all numbers and start again from #001?')) { state = blank(); lastAnnounced = null; save(); $('ticket').classList.remove('show'); }
+    if (confirm('Clear all numbers and start again from #001?')) { state = blank(); save(); $('ticket').classList.remove('show'); }
   };
 
   syncNotify();
