@@ -214,7 +214,8 @@
   // Take requests this device sent, kept across reloads. A take whose outcome is unknown (it
   // reported an error, but may have landed) stays "pending": the next tap reuses its id, so it
   // can't create a second ticket, and any ticket carrying one of these ids is claimed as ours.
-  const REQS_KEY = 'massageQueue.reqs', PENDING_KEY = 'massageQueue.pendingReq';
+  const REQS_KEY = 'massageQueue.reqs', PENDING_KEY = 'massageQueue.pendingTake';
+  const PENDING_REUSE_MS = 2 * 60000;
   const readJson = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || 'null') ?? d; } catch { return d; } };
   const writeJson = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch {} };
   const myReqs = () => readJson(REQS_KEY, []);
@@ -225,7 +226,7 @@
     for (const t of state.tickets) {
       if (!t.req || !reqs.has(t.req)) continue;
       if (t.status !== 'done' && t.status !== 'skipped') addMine(t.num);
-      if (t.req === pending) writeJson(PENDING_KEY, null); // its outcome is known now
+      if (pending && t.req === pending.req) writeJson(PENDING_KEY, null); // its outcome is known now
     }
   }
   const isMine = t => t && myNums().includes(t.num);
@@ -269,14 +270,11 @@
   const CALL_TIMEOUT_MS = 15000;
   const withTimeout = (p, ms = CALL_TIMEOUT_MS) => Promise.race([p, new Promise((_, reject) =>
     setTimeout(() => reject({ code: 'unavailable', message: 'The store did not answer in time.' }), ms))]);
-  // A release we stopped waiting for may still land later and shorten whatever lease we hold
-  // then, so count the ones still in flight and budget a new lease as 1 s while any are.
-  let releasesInFlight = 0;
-  const release = () => {
-    releasesInFlight++;
-    const p = ref.acquire({ holder: tabId, ttlMs: 1000 }).catch(() => {}).finally(() => { releasesInFlight--; });
-    return withTimeout(p, 5000).catch(() => {});
-  };
+  // Every save attempt holds the lease under its own holder name and releases it under that same
+  // name. A release that answers late can then only renew its own, already-finished lease; against
+  // a newer attempt's lease it is just a busy request and can't shorten it.
+  let attemptSeq = 0;
+  const release = holder => withTimeout(ref.acquire({ holder, ttlMs: 1000 }), 5000).catch(() => {});
 
   // Errors that retrying can't fix. Anything else (unavailable, unknown codes) is retried briefly.
   const FATAL = new Set(['invalid_argument', 'resource_exhausted', 'quota_exceeded', 'revoked',
@@ -298,9 +296,10 @@
     const limit = () => Math.max(1000, Math.min(CALL_TIMEOUT_MS, deadline - Date.now()));
     while (Date.now() < deadline) {
       const askedAt = Date.now();
+      const holder = tabId + ':' + (++attemptSeq);
       let lease = null;
       try {
-        lease = await withTimeout(ref.acquire({ holder: tabId, ttlMs: LEASE_MS }), limit());
+        lease = await withTimeout(ref.acquire({ holder, ttlMs: LEASE_MS }), limit());
         const gotAt = Date.now();
         rttMs = 0.7 * rttMs + 0.3 * (gotAt - askedAt);
         if (!lease.acquired) {
@@ -313,19 +312,18 @@
         learnOffset(lease, askedAt, gotAt, LEASE_MS);
         // The lease was granted about halfway through the round trip.
         const grantedAt = (askedAt + gotAt) / 2;
-        const leaseBudget = releasesInFlight > 0 ? 1000 : LEASE_MS;
         const snap = await withTimeout(ref.get(), limit());
         const s = snap.exists ? structuredClone(snap.data()) : blank();
         s.tickets = s.tickets || [];
         const result = fn(s);
-        if (result === false) { await release(); return null; }
+        if (result === false) { await release(holder); return null; }
         // The change is already saved (an earlier attempt landed even though it reported an error).
-        if (result && result.alreadySaved) { await release(); clearWriteError(); return result.value; }
+        if (result && result.alreadySaved) { await release(holder); clearWriteError(); return result.value; }
         advance(s); prune(s);
         // If the write might land after the lease lapses, another device could have read the same
         // state. Let go, back off and try again a limited number of times rather than overwrite theirs.
-        if (Date.now() + rttMs / 2 + LEASE_MARGIN_MS > grantedAt + leaseBudget) {
-          await release();
+        if (Date.now() + rttMs / 2 + LEASE_MARGIN_MS > grantedAt + LEASE_MS) {
+          await release(holder);
           if (++slowTries >= MAX_SLOW_TRIES) {
             setStatus('Your connection is too slow to save changes right now. Try again on a stronger signal.', true);
             return null;
@@ -334,11 +332,11 @@
           continue;
         }
         await withTimeout(ref.set(s), limit());
-        await release();
+        await release(holder);
         clearWriteError();
         return result;
       } catch (e) {
-        if (lease && lease.acquired) await release();
+        if (lease && lease.acquired) await release(holder);
         const code = e && e.code;
         if (!FATAL.has(code) && ++transientTries <= MAX_TRANSIENT_TRIES && Date.now() < deadline) {
           await sleep(200 + Math.random() * 400); // a brief outage: retry as the store's docs advise
@@ -359,6 +357,9 @@
     if (code === 'invalid_argument' && writeUnknown) {
       canWrite = false; render();
       setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true);
+    } else if (code === 'invalid_argument' || code === 'transform_error') {
+      // The request itself was refused, so the connection isn't the problem.
+      setStatus('That change could not be saved. Reload the page and try again.', true);
     } else if (code === 'revoked' || code === 'not_granted' || code === 'capability_disabled' || code === 'capability_removed') {
       // Every later call will fail too, so stop offering actions.
       canWrite = false; render();
@@ -379,6 +380,9 @@
   let takeSeq = 0;
   const takeNumber = (name, minutes, req = tabId + ':' + (++takeSeq)) => mutate(s => {
     const existing = s.tickets.find(t => t.req === req);
+    // A ticket that has already finished is never handed out again; the caller starts a fresh request.
+    if (existing && (existing.status === 'done' || existing.status === 'skipped'))
+      return { alreadySaved: true, value: { finished: true } };
     if (existing) return { alreadySaved: true, value: { num: existing.num, epoch: s.epoch } };
     const t = { num: ++s.lastNum, name, minutes, status: 'waiting', req };
     s.tickets.push(t);
@@ -430,7 +434,15 @@
   const audioReady = () => !!audio && audio.state === 'running';
   async function unlockAudio() {
     try {
-      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      if (!audio) {
+        audio = new (window.AudioContext || window.webkitAudioContext)();
+        // Phones can suspend or interrupt audio in the background. Keep the sound UI truthful,
+        // and listen for taps again so the next tap anywhere can turn it back on.
+        audio.onstatechange = () => {
+          refreshSoundUi();
+          if (!audioReady()) document.addEventListener('click', unlockOnTap);
+        };
+      }
       await audio.resume();
     } catch {}
   }
@@ -510,10 +522,12 @@
   }
   function setStatus(text, err) { const s = $('status'); s.textContent = text; s.classList.toggle('err', !!err); }
 
-  let pointerIsDown = false, renderDeferred = false;
+  let pointerIsDown = false, pointerDownAt = 0, renderDeferred = false;
+  const isMidTap = () => pointerIsDown && Date.now() - pointerDownAt < 1500;
   function render({ keepButtons = false } = {}) {
     // Mid-tap, keep the buttons and rebuild them once the tap is over (see pointerDone).
-    if (!keepButtons && pointerIsDown) { renderDeferred = true; keepButtons = true; }
+    const midTap = isMidTap();
+    if (!keepButtons && midTap) { renderDeferred = true; keepButtons = true; }
     const past = lastFinished(), cur = inChair(), q = waiting(), nxt = q[0], eta = etas();
 
     $('pastNum').textContent = past ? fmt(past.num) : '—';
@@ -552,7 +566,8 @@
     // My ticket card
     const mine = myNums().map(n => tickets().find(t => t.num === n)).filter(t => t && t.status !== 'done' && t.status !== 'skipped');
     const card = $('mine');
-    if (mine.length) {
+    if (midTap) { renderDeferred = true; /* its "Turn on alert sound" button may be under the finger */ }
+    else if (mine.length) {
       const t = mine[0];
       card.replaceChildren();
       const l = document.createElement('span'); l.className = 'eyebrow'; l.textContent = 'Your number';
@@ -655,11 +670,23 @@
     if (!soundTouched) { soundOn = true; saveSound(true); } // respect a viewer who turned sound off
     unlockAudio().then(refreshSoundUi);
     const minutes = Math.min(30, Math.max(15, parseInt(dur.value, 10) || 15));
+    const name = $('name').value.trim().slice(0, 30);
+    const newReq = () => tabId + ':' + Date.now() + ':' + Math.random().toString(36).slice(2, 6);
     // Reuse the id of an earlier take whose outcome is unknown, so a retry can't add a second ticket.
-    const req = readJson(PENDING_KEY, null) || (tabId + ':' + Date.now() + ':' + Math.random().toString(36).slice(2, 6));
-    writeJson(PENDING_KEY, req);
-    rememberReq(req);
-    let res = await takeNumber($('name').value.trim().slice(0, 30), minutes, req);
+    // Only when it looks like the same person trying again (same name and time, within 2 minutes):
+    // on a shared kiosk, the next person must never be handed the previous person's ticket.
+    const pending = readJson(PENDING_KEY, null);
+    const samePerson = pending && pending.req && pending.name === name && pending.minutes === minutes
+      && Date.now() - pending.at < PENDING_REUSE_MS;
+    let req = samePerson ? pending.req : newReq();
+    const markPending = r => { writeJson(PENDING_KEY, { req: r, name, minutes, at: Date.now() }); rememberReq(r); };
+    markPending(req);
+    let res = await takeNumber(name, minutes, req);
+    // The earlier ticket with this id has already finished: never hand it out again; take a new one.
+    if (res && res.finished) {
+      req = newReq(); markPending(req);
+      res = await takeNumber(name, minutes, req);
+    }
     taking = false;
     // The save reported failure, but a live update may already show it landed.
     if (!res && state && state.tickets) {
@@ -800,12 +827,23 @@
 
   // While a finger or mouse button is down, hold off rebuilding buttons, so an update arriving from
   // another device mid-tap can't swallow the tap. The rebuild runs right after the tap.
-  document.addEventListener('pointerdown', () => { pointerIsDown = true; }, true);
-  const pointerDone = () => {
+  // Some presses never report their end to the page (a right-click whose menu swallows the release,
+  // a drag that ends outside the frame), so a press counts for at most 1.5 s, and a few other
+  // events also end it. After that the held-back rebuild runs anyway.
+  const MAX_PRESS_MS = 1500;
+  let pressTimer = null;
+  document.addEventListener('pointerdown', () => {
+    pointerIsDown = true; pointerDownAt = Date.now();
+    clearTimeout(pressTimer);
+    pressTimer = setTimeout(pointerDone, MAX_PRESS_MS + 50);
+  }, true);
+  function pointerDone() {
     pointerIsDown = false;
+    clearTimeout(pressTimer);
     if (renderDeferred) { renderDeferred = false; setTimeout(() => render(), 350); }
-  };
-  document.addEventListener('pointerup', pointerDone, true);
-  document.addEventListener('pointercancel', pointerDone, true);
+  }
+  ['pointerup', 'pointercancel', 'lostpointercapture', 'contextmenu'].forEach(ev =>
+    document.addEventListener(ev, pointerDone, true));
+  window.addEventListener('blur', pointerDone);
 })();
 </script>

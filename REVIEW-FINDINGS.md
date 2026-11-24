@@ -8,9 +8,69 @@ This file records the code reviews of the Massage Chair Queue and how each findi
 | 2 | 24 Nov 2026 | 10 (5 important, 5 minor) | Fixed in `050ada7` |
 | 3 | 24 Nov 2026 | 7 (1 important, 6 minor) | Fixed |
 | 4 | 24 Nov 2026 | 4 (1 important, 3 minor) + 3 polish | Fixed |
-| 5 | 24 Nov 2026 | 6 (2 important, 4 minor) + 4 polish | Fixed (see below) |
+| 5 | 24 Nov 2026 | 6 (2 important, 4 minor) + 4 polish | Fixed in `c13d84f` |
+| 6 | 24 Nov 2026 | 4 minor + 3 polish, **no important bugs** | Fixed (see below) |
 
 The shared phone version is [shared/massage-queue.html](shared/massage-queue.html), and the single-screen version is [index.html](index.html).
+
+# Sixth review
+
+The sixth review found **no important bugs**. It confirmed that all five round-5 fixes work, that the take request ids only claim tickets this browser created and never get stuck, and that `index.html` has no regressions. It found 4 minor edge cases and 3 polish items, all fixed below. As requested, no further review rounds were run after this one.
+
+| # | Severity | Finding | Fixed in |
+|---|---|---|---|
+| R6-1 | Minor | A lock-release request that never answered made every later save fail as "too slow" | shared |
+| R6-2 | Minor | On a shared kiosk, the next person's tap could be given the previous person's ticket | shared |
+| R6-3 | Minor | A reused request could return a ticket that had already finished | shared |
+| R6-4 | Minor | A press whose release the page never saw left the list and buttons stale | shared |
+| P-8 | Polish | An update arriving mid-tap could still remove the "Turn on alert sound" button | shared |
+| P-9 | Polish | The page didn't notice when a phone suspended its sound in the background | shared |
+| P-10 | Polish | Refused requests still said "Check your connection" | shared |
+
+### R6-1. A hung lock release made every save "too slow"
+
+**Cause.** The round-5 fix (R5-3) counted lock-release requests still waiting for an answer, and treated new locks as lasting only 1 second while any were. One that never answered kept the count above zero for good, so every later save failed as "too slow" until the page was reloaded.
+
+**Fix.** Each save attempt now takes the lock under its own holder name and releases it under that same name. A release that answers late can only affect its own, already-finished lock. Against a newer attempt's lock, the store just reports it as busy. The counter and the 1-second budget are removed.
+
+### R6-2. The next person on a kiosk could get the previous person's ticket
+
+**Cause.** A take whose outcome was unknown was reused by the next tap on that device, even if a different person made it.
+
+**Fix.** The pending take now records the name, the duration and the time. It's reused only when the next tap has the same name and duration and comes within 2 minutes, which looks like the same person trying again. Otherwise the tap starts a new request. An earlier person's ticket is still claimed for that device by the live update.
+
+### R6-3. A reused request could return a finished ticket
+
+**Fix.** If a reused request's ticket has already finished or been skipped, it's never handed out again. The tap starts a fresh request and takes a new number.
+
+### R6-4. A missed press release left the board stale
+
+**Cause.** Rebuilding the buttons was held back while a press was in progress, and only the press's release ended that state. Some presses never report a release to the page, such as a right-click whose menu takes it, or a drag that ends outside the frame.
+
+**Fix.**
+- A press counts for at most 1.5 seconds, after which the held-back rebuild runs.
+- A right-click, the window losing focus, or the page losing the pointer also ends the press.
+
+### Polish
+
+- **P-8, the "Turn on alert sound" button:** the "Your number" card is now held back mid-tap too.
+- **P-9, sound suspended in the background:** the page now watches the sound's state. If a phone suspends sound in the background, the card stops promising a chime, and the next tap anywhere turns it back on.
+- **P-10, refused requests:** a request refused as invalid now says "That change could not be saved. Reload the page and try again." instead of blaming the connection.
+
+## Sixth review testing
+
+Tested in a local browser against a temporary stand-in for the claude.ai store, built and run without subagents.
+
+| Test | Result |
+|---|---|
+| Lock-release requests never answer, then two people take numbers | Both got numbers (#001, then #002), each in about 5.5 s, and no "too slow" error |
+| Cara's take lands silently and its retries fail, then Dan taps on the same kiosk | Dan got a new #003, not Cara's #002 |
+| Same person retries after their unknown ticket was skipped | A new ticket (#003) with a fresh request. The skipped #002 wasn't handed out |
+| Button pressed, another device's update arrives, release never reported | The list held still during the press, then caught up within 2 s |
+| A save refused as `invalid_argument` | Showed "That change could not be saved. Reload the page and try again." |
+| Script errors | None |
+
+**Not tested:** the real claude.ai store and real phones.
 
 # Fifth review
 
