@@ -323,7 +323,8 @@
     if (cur && cur.status === 'called') {
       banner.innerHTML = `<strong>${fmtNum(cur.num)}</strong>${cur.name ? ' · ' + esc(cur.name) : ''}<br>Please proceed to the massage chair 💆`;
       banner.classList.add('show');
-      announce(cur);
+      // No announce() here: only the tab whose action called the number announces it
+      // (in advanceIfFree), so two open tabs don't chime twice or miss a call after a reset.
     } else banner.classList.remove('show');
 
     const ul = $('queueList');

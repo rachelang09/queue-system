@@ -172,16 +172,23 @@
   const tabId = Math.random().toString(36).slice(2);
   const $ = id => document.getElementById(id);
 
-  const LEASE_MS = 3000;        // lease length for one write
-  const LEASE_SAFE_MS = 2000;   // give up on a write that would land after the lease may have lapsed
-  const OTHER_DEVICE_GRACE_MS = 120000; // other devices wait this long past 0:00 before ending a session (clock skew)
+  const LEASE_MS = 5000;            // lease length for one write
+  const LEASE_MARGIN_MS = 500;      // a write must land at least this long before the lease can lapse
+  const WRITE_DEADLINE_MS = 25000;  // keep retrying a write for this long before giving up
+  const FINISH_GRACE_MS = 3000;     // end a session this long after 0:00 (server time)
+  const SOUND_KEY = 'massageQueue.sound';
   let db = null, ref = null, state = null, canWrite = false, writeUnknown = false, isEditor = false;
+
+  // Server clock: every device stamps and compares times on the store's clock, learned from
+  // lease expiry times, so a phone with a wrong clock can't end sessions early or show odd timers.
+  let clockOffset = 0, rttMs = 300;
+  const now = () => Date.now() + clockOffset;
 
   // ---------- helpers ----------
   const fmt = n => '#' + String(n).padStart(3, '0');
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const clockTime = ms => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  const mmss = ms => { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const mmss = ms => { const s = Math.ceil(Math.max(0, ms) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
   const blank = () => ({ epoch: Math.random().toString(36).slice(2, 8), lastNum: 0, tickets: [] });
 
   const tickets = () => (state && state.tickets) || [];
@@ -189,7 +196,7 @@
   const waiting = () => tickets().filter(t => t.status === 'waiting').sort((a, b) => a.num - b.num);
   const lastFinished = () => tickets().filter(t => t.status === 'done' || t.status === 'skipped')
     .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))[0];
-  const remaining = t => Math.max(0, t.startedAt + t.minutes * 60000 - Date.now());
+  const remaining = t => Math.max(0, t.startedAt + t.minutes * 60000 - now());
   const who = t => t.name ? t.name : 'Guest';
 
   // Tickets this browser took (per-device memory, tied to the current queue epoch).
@@ -207,7 +214,7 @@
   // Start time estimates for everyone waiting.
   function etas() {
     const cur = inChair();
-    let free = Date.now();
+    let free = now();
     if (cur) free += cur.status === 'active' ? remaining(cur) : cur.minutes * 60000;
     const out = {};
     for (const t of waiting()) { out[t.num] = free; free += t.minutes * 60000; }
@@ -218,7 +225,7 @@
   function advance(s) {
     if (s.tickets.some(t => t.status === 'active' || t.status === 'called')) return;
     const nxt = s.tickets.filter(t => t.status === 'waiting').sort((a, b) => a.num - b.num)[0];
-    if (nxt) { nxt.status = 'called'; nxt.calledAt = Date.now(); }
+    if (nxt) { nxt.status = 'called'; nxt.calledAt = now(); }
   }
   function prune(s) {
     const fin = s.tickets.filter(t => t.status === 'done' || t.status === 'skipped')
@@ -227,37 +234,69 @@
     s.tickets = s.tickets.filter(t => !drop.has(t.num));
   }
 
-  async function mutate(fn) {
+  // Writes from this page run one at a time. The lease can't keep them apart, because a second
+  // acquire from the same holder counts as a renewal.
+  let writeChain = Promise.resolve();
+  function mutate(fn) {
+    const run = writeChain.then(() => mutateNow(fn));
+    writeChain = run.catch(() => {});
+    return run;
+  }
+
+  // Shorten our lease once we're done, so other devices don't wait out the full lease.
+  const releaseSoon = () => { ref.acquire({ holder: tabId, ttlMs: 1000 }).catch(() => {}); };
+
+  async function mutateNow(fn) {
     if (!ref || !canWrite) return null;
-    for (let i = 0; i < 12; i++) {
-      let lease;
+    const deadline = Date.now() + WRITE_DEADLINE_MS;
+    let tooSlow = false;
+    while (Date.now() < deadline) {
       const askedAt = Date.now();
+      let lease;
       try { lease = await ref.acquire({ holder: tabId, ttlMs: LEASE_MS }); }
-      catch (e) { setStatus(errText(e), true); return null; }
-      if (!lease.acquired) { await sleep(250 + Math.random() * 400); continue; }
+      catch (e) { handleWriteError(e); return null; }
+      const gotAt = Date.now();
+      rttMs = 0.7 * rttMs + 0.3 * (gotAt - askedAt);
+      const exp = Date.parse(lease.expiresAt || '');
+      if (!lease.acquired) {
+        // Wait until the other device's lease ends, but never longer than 2 s at a time.
+        const wait = isNaN(exp) ? 400 : Math.min(2000, Math.max(150, exp - now()));
+        await sleep(wait + Math.random() * 300);
+        continue;
+      }
+      // The lease was granted roughly halfway through the round trip, at server time exp - LEASE_MS.
+      if (!isNaN(exp)) clockOffset = (exp - LEASE_MS) - (askedAt + gotAt) / 2;
       try {
         const snap = await ref.get();
         const s = snap.exists ? structuredClone(snap.data()) : blank();
         s.tickets = s.tickets || [];
         const result = fn(s);
-        if (result === false) return null;
+        if (result === false) { releaseSoon(); return null; }
         advance(s); prune(s);
-        // On a slow connection the lease may lapse before we write; another device could then
-        // have read the same state. Start over with fresh data instead of overwriting theirs.
-        if (Date.now() - askedAt > LEASE_SAFE_MS) continue;
+        // The lease was granted no earlier than askedAt. If the write might land after it lapses,
+        // another device could have read the same state: start over instead of overwriting theirs.
+        if (Date.now() + rttMs / 2 + LEASE_MARGIN_MS > askedAt + LEASE_MS) { tooSlow = true; continue; }
         await ref.set(s);
+        releaseSoon();
+        clearWriteError();
         return result;
-      } catch (e) {
-        if (e && e.code === 'invalid_argument' && writeUnknown) {
-          canWrite = false; render();
-          setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true);
-        } else setStatus(errText(e), true);
-        return null;
-      }
+      } catch (e) { handleWriteError(e); return null; }
     }
-    setStatus('The queue is busy. Try again in a moment.', true);
+    setStatus(tooSlow ? 'Your connection is too slow to save changes right now. Try again on a stronger signal.'
+      : 'The queue is busy. Try again in a moment.', true);
     return null;
   }
+
+  // A view-only person's first write is refused. Switch to read-only instead of
+  // reporting a connection problem on every tap.
+  function handleWriteError(e) {
+    if (e && e.code === 'invalid_argument' && writeUnknown) {
+      canWrite = false; render();
+      setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true);
+    } else setStatus(errText(e), true);
+  }
+  const liveText = () => canWrite ? 'Live · updates on every device with this page open.' : 'Live · view only.';
+  function clearWriteError() { if ($('status').classList.contains('err')) setStatus(liveText()); }
   const errText = e => e && e.code === 'quota_exceeded' ? 'The queue storage is full. Reset the queue to continue.'
     : 'Could not reach the queue. Check your connection and try again.';
 
@@ -269,17 +308,16 @@
   const startSession = num => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
     if (!t || t.status !== 'called') return false;
-    t.status = 'active'; t.startedAt = Date.now(); t.startedBy = tabId; return true;
+    t.status = 'active'; t.startedAt = now(); return true;
   });
   const finishSession = (num, status) => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
     if (!t || (t.status !== 'active' && t.status !== 'called')) return false;
-    t.status = status; t.endedAt = Date.now(); return true;
+    t.status = status; t.endedAt = now(); return true;
   });
-  // The device that started the timer ends it at 0:00. Other devices only step in after a grace
-  // period, so a phone with a fast clock can't cut someone's session short.
-  const finishGrace = t => t.startedBy === tabId ? 0 : OTHER_DEVICE_GRACE_MS;
-  const dueToFinish = t => Date.now() - (t.startedAt + t.minutes * 60000) >= finishGrace(t);
+  // Any device may end a session a few seconds after 0:00 on the server's clock. The check inside
+  // autoFinish runs right after a lease, when this device's clock offset is freshly measured.
+  const dueToFinish = t => now() - (t.startedAt + t.minutes * 60000) >= FINISH_GRACE_MS;
   const autoFinish = num => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
     if (!t || t.status !== 'active' || !dueToFinish(t)) return false;
@@ -293,12 +331,21 @@
   const resetQueue = () => mutate(s => { Object.assign(s, blank()); return true; });
 
   // ---------- alerts ----------
-  let audio = null, soundOn = false, soundTouched = false, lastCalled = undefined;
-  function unlockAudio() {
-    try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
+  // The sound choice is remembered on this device; browsers still need one tap per page load
+  // before audio can play, so the page asks for that tap when it matters.
+  const readSound = () => { try { return localStorage.getItem(SOUND_KEY); } catch { return null; } };
+  const saveSound = on => { try { localStorage.setItem(SOUND_KEY, on ? 'on' : 'off'); } catch {} };
+  let audio = null, soundOn = readSound() === 'on', soundTouched = readSound() !== null, lastCalled = undefined;
+  const audioReady = () => !!audio && audio.state === 'running';
+  async function unlockAudio() {
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      await audio.resume();
+    } catch {}
+    syncSound(); render();
   }
   function chime(times = 1) {
-    if (!soundOn || !audio) return;
+    if (!soundOn || !audioReady()) return;
     try {
       for (let r = 0; r < times; r++) [660, 880, 990].forEach((f, i) => {
         const o = audio.createOscillator(), g = audio.createGain();
@@ -344,18 +391,27 @@
     return b;
   }
   // Two-tap button for destructive actions (dialogs are not available in the viewer).
-  function confirmBtn(text, armedText, fn) {
+  // The armed state is kept outside the button, so a re-render from another device's change
+  // doesn't swallow the second tap.
+  const ARM_MS = 4000;
+  let armed = { key: null, until: 0 };
+  const isArmed = key => armed.key === key && Date.now() < armed.until;
+  function confirmBtn(key, text, armedText, fn) {
     const b = document.createElement('button');
-    b.className = 'danger'; b.textContent = text; b.disabled = !canWrite;
-    let timer;
+    b.className = 'danger'; b.disabled = !canWrite;
+    const show = on => { b.classList.toggle('armed', on); b.textContent = on ? armedText : text; };
+    show(isArmed(key));
+    if (isArmed(key)) setTimeout(() => { if (!isArmed(key)) show(false); }, armed.until - Date.now() + 50);
     b.onclick = async () => {
-      if (!b.classList.contains('armed')) {
-        b.classList.add('armed'); b.textContent = armedText;
-        timer = setTimeout(() => { b.classList.remove('armed'); b.textContent = text; }, 4000);
+      if (!isArmed(key)) {
+        armed = { key, until: Date.now() + ARM_MS };
+        show(true);
+        setTimeout(() => { if (!isArmed(key)) show(false); }, ARM_MS + 50);
         return;
       }
-      clearTimeout(timer); b.disabled = true; await fn();
-      b.classList.remove('armed'); b.textContent = text; b.disabled = !canWrite;
+      armed = { key: null, until: 0 };
+      b.disabled = true; await fn();
+      show(false); b.disabled = !canWrite;
     };
     return b;
   }
@@ -374,11 +430,11 @@
     const acts = $('curActions'); acts.replaceChildren();
     if (cur && cur.status === 'called') {
       acts.append(btn("I'm here, start timer", 'go', () => startSession(cur.num)));
-      const skip = confirmBtn('Skip (no-show)', 'Tap again to skip', () => finishSession(cur.num, 'skipped'));
+      const skip = confirmBtn('skip-' + cur.num, 'Skip (no-show)', 'Tap again to skip', () => finishSession(cur.num, 'skipped'));
       skip.id = 'skipBtn'; skip.title = `Available ${GRACE_MIN} min after the number is called`;
       acts.append(skip);
     } else if (cur) {
-      acts.append(btn('End session early', '', () => finishSession(cur.num, 'done')));
+      acts.append(confirmBtn('end-' + cur.num, 'End session early', 'Tap again to end', () => finishSession(cur.num, 'done')));
     }
 
     // Called banner
@@ -408,9 +464,18 @@
       else if (t.status === 'active') m.textContent = `Enjoy your session · ${mmss(remaining(t))} left`;
       else {
         const ahead = q.filter(w => w.num < t.num).length + (cur ? 1 : 0);
-        m.textContent = `${ahead} ahead of you · starts around ${clockTime(eta[t.num])}. Keep this page open; it will chime when it's your turn.`;
+        m.textContent = `${ahead} ahead of you · starts around ${clockTime(eta[t.num])}. ` +
+          (soundOn && audioReady() ? "Keep this page open; it will chime when it's your turn."
+            : "Keep this page open. Turn on the alert sound so this phone chimes when it's your turn.");
       }
       card.append(l, n, m);
+      // Only promise a chime when one will actually play; otherwise offer the tap that enables it.
+      if (t.status === 'waiting' && !(soundOn && audioReady())) {
+        const sb = document.createElement('button');
+        sb.textContent = 'Turn on alert sound';
+        sb.onclick = async () => { soundOn = true; soundTouched = true; saveSound(true); await unlockAudio(); chime(); };
+        card.append(sb);
+      }
       card.hidden = false;
     } else card.hidden = true;
 
@@ -427,36 +492,39 @@
       const e = document.createElement('span'); e.className = 'eta';
       e.textContent = (i === 0 ? 'Next' : `${i} ahead`) + ' · ~' + clockTime(eta[t.num]);
       li.append(n, w, e);
-      if (isMine(t) || isEditor) li.append(confirmBtn(isMine(t) ? 'Leave' : 'Remove', 'Tap again', () => leave(t.num)));
+      if (isMine(t) || isEditor) li.append(confirmBtn('leave-' + t.num, isMine(t) ? 'Leave' : 'Remove', 'Tap again', () => leave(t.num)));
       ul.append(li);
     });
 
-    $('take').disabled = !canWrite || !state;
+    // Stay disabled while a take is still saving, even when other devices' updates re-render.
+    $('take').disabled = taking || !canWrite || !state;
     $('reset').hidden = !isEditor;
     $('reset').disabled = !canWrite || !state;
     tick(true);
   }
 
-  let finishing = null;
+  let finishing = null, nextFinishTry = 0;
   function tick(fromRender) {
-    $('clock').textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    $('clock').textContent = new Date(now()).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
     const cur = inChair(), timer = $('curTimer'), bar = $('curBar');
     if (!cur) { timer.textContent = ''; bar.style.width = '0'; return; }
     if (cur.status === 'called') {
       timer.className = 'timer small';
-      timer.textContent = 'Waiting for arrival · ' + mmss(Date.now() - cur.calledAt);
+      timer.textContent = 'Waiting for arrival · ' + mmss(now() - cur.calledAt);
       bar.style.width = '0';
       const skip = $('skipBtn');
-      if (skip && canWrite && !skip.classList.contains('armed')) skip.disabled = Date.now() - cur.calledAt < GRACE_MIN * 60000;
+      if (skip && canWrite && !skip.classList.contains('armed')) skip.disabled = now() - cur.calledAt < GRACE_MIN * 60000;
     } else {
       const rem = remaining(cur);
       timer.className = 'timer';
       timer.textContent = mmss(rem) + ' left';
-      bar.style.width = (100 - rem / (cur.minutes * 600)) + '%';
-      if (rem === 0 && finishing !== cur.num && canWrite && dueToFinish(cur)) {
+      bar.style.width = Math.min(100, Math.max(0, 100 - rem / (cur.minutes * 600))) + '%';
+      if (rem === 0 && finishing !== cur.num && canWrite && dueToFinish(cur) && Date.now() >= nextFinishTry) {
         finishing = cur.num;
-        // Clear the guard if the write didn't go through, so the next tick tries again.
-        autoFinish(cur.num).then(r => { if (r == null && finishing === cur.num) finishing = null; });
+        // If the write didn't go through, clear the guard and try again in 5 s.
+        autoFinish(cur.num).then(r => {
+          if (r == null && finishing === cur.num) { finishing = null; nextFinishTry = Date.now() + 5000; }
+        });
       }
     }
     if (!fromRender && isMine(cur) && cur.status === 'active') {
@@ -479,12 +547,16 @@
   }
   dur.oninput = syncDur; syncDur();
 
+  let taking = false;
   $('take').onclick = async () => {
+    if (taking) return;
+    taking = true;
     const b = $('take'); b.disabled = true; b.textContent = 'Getting your number…';
+    if (!soundTouched) { soundOn = true; saveSound(true); } // respect a viewer who turned sound off
     unlockAudio();
-    if (!soundTouched) { soundOn = true; syncSound(); } // respect a viewer who turned sound off
     const minutes = Math.min(30, Math.max(15, parseInt(dur.value, 10) || 15));
     const res = await takeNumber($('name').value.trim().slice(0, 30), minutes);
+    taking = false;
     if (res) {
       try {
         const prev = JSON.parse(localStorage.getItem(MY_KEY) || 'null');
@@ -500,10 +572,16 @@
 
   function syncSound() {
     const b = $('sound');
-    b.textContent = soundOn ? 'Sound on' : 'Turn on sound';
-    b.classList.toggle('sel', soundOn);
+    const playing = soundOn && audioReady();
+    b.textContent = playing ? 'Sound on' : soundOn ? 'Tap to enable sound' : 'Turn on sound';
+    b.classList.toggle('sel', playing);
   }
-  $('sound').onclick = () => { unlockAudio(); soundTouched = true; soundOn = !soundOn; syncSound(); if (soundOn) chime(); };
+  $('sound').onclick = async () => {
+    soundTouched = true; soundOn = !soundOn; saveSound(soundOn);
+    await unlockAudio();
+    if (soundOn) chime();
+  };
+  syncSound();
 
   const resetBtn = $('reset');
   let resetTimer;
