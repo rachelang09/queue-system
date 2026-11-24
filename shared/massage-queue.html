@@ -172,7 +172,10 @@
   const tabId = Math.random().toString(36).slice(2);
   const $ = id => document.getElementById(id);
 
-  let db = null, ref = null, state = null, canWrite = false;
+  const LEASE_MS = 3000;        // lease length for one write
+  const LEASE_SAFE_MS = 2000;   // give up on a write that would land after the lease may have lapsed
+  const OTHER_DEVICE_GRACE_MS = 120000; // other devices wait this long past 0:00 before ending a session (clock skew)
+  let db = null, ref = null, state = null, canWrite = false, writeUnknown = false, isEditor = false;
 
   // ---------- helpers ----------
   const fmt = n => '#' + String(n).padStart(3, '0');
@@ -228,7 +231,8 @@
     if (!ref || !canWrite) return null;
     for (let i = 0; i < 12; i++) {
       let lease;
-      try { lease = await ref.acquire({ holder: tabId, ttlMs: 2000 }); }
+      const askedAt = Date.now();
+      try { lease = await ref.acquire({ holder: tabId, ttlMs: LEASE_MS }); }
       catch (e) { setStatus(errText(e), true); return null; }
       if (!lease.acquired) { await sleep(250 + Math.random() * 400); continue; }
       try {
@@ -238,11 +242,16 @@
         const result = fn(s);
         if (result === false) return null;
         advance(s); prune(s);
+        // On a slow connection the lease may lapse before we write; another device could then
+        // have read the same state. Start over with fresh data instead of overwriting theirs.
+        if (Date.now() - askedAt > LEASE_SAFE_MS) continue;
         await ref.set(s);
         return result;
       } catch (e) {
-        if (e && e.code === 'invalid_argument') { canWrite = false; render(); setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true); }
-        else setStatus(errText(e), true);
+        if (e && e.code === 'invalid_argument' && writeUnknown) {
+          canWrite = false; render();
+          setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true);
+        } else setStatus(errText(e), true);
         return null;
       }
     }
@@ -260,16 +269,20 @@
   const startSession = num => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
     if (!t || t.status !== 'called') return false;
-    t.status = 'active'; t.startedAt = Date.now(); return true;
+    t.status = 'active'; t.startedAt = Date.now(); t.startedBy = tabId; return true;
   });
   const finishSession = (num, status) => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
     if (!t || (t.status !== 'active' && t.status !== 'called')) return false;
     t.status = status; t.endedAt = Date.now(); return true;
   });
+  // The device that started the timer ends it at 0:00. Other devices only step in after a grace
+  // period, so a phone with a fast clock can't cut someone's session short.
+  const finishGrace = t => t.startedBy === tabId ? 0 : OTHER_DEVICE_GRACE_MS;
+  const dueToFinish = t => Date.now() - (t.startedAt + t.minutes * 60000) >= finishGrace(t);
   const autoFinish = num => mutate(s => {
     const t = s.tickets.find(t => t.num === num);
-    if (!t || t.status !== 'active' || remaining(t) > 0) return false;
+    if (!t || t.status !== 'active' || !dueToFinish(t)) return false;
     t.status = 'done'; t.endedAt = t.startedAt + t.minutes * 60000; return true;
   });
   const leave = num => mutate(s => {
@@ -280,7 +293,7 @@
   const resetQueue = () => mutate(s => { Object.assign(s, blank()); return true; });
 
   // ---------- alerts ----------
-  let audio = null, soundOn = false, lastCalled = undefined;
+  let audio = null, soundOn = false, soundTouched = false, lastCalled = undefined;
   function unlockAudio() {
     try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
   }
@@ -327,7 +340,7 @@
     const b = document.createElement('button');
     b.textContent = text; if (cls) b.className = cls;
     b.disabled = !canWrite;
-    b.onclick = async () => { b.disabled = true; await fn(); };
+    b.onclick = async () => { b.disabled = true; await fn(); b.disabled = !canWrite; };
     return b;
   }
   // Two-tap button for destructive actions (dialogs are not available in the viewer).
@@ -342,6 +355,7 @@
         return;
       }
       clearTimeout(timer); b.disabled = true; await fn();
+      b.classList.remove('armed'); b.textContent = text; b.disabled = !canWrite;
     };
     return b;
   }
@@ -412,11 +426,13 @@
       if (isMine(t)) { const y = document.createElement('span'); y.className = 'you'; y.textContent = 'You'; w.append(y); }
       const e = document.createElement('span'); e.className = 'eta';
       e.textContent = (i === 0 ? 'Next' : `${i} ahead`) + ' · ~' + clockTime(eta[t.num]);
-      li.append(n, w, e, confirmBtn('Leave', 'Remove?', () => leave(t.num)));
+      li.append(n, w, e);
+      if (isMine(t) || isEditor) li.append(confirmBtn(isMine(t) ? 'Leave' : 'Remove', 'Tap again', () => leave(t.num)));
       ul.append(li);
     });
 
     $('take').disabled = !canWrite || !state;
+    $('reset').hidden = !isEditor;
     $('reset').disabled = !canWrite || !state;
     tick(true);
   }
@@ -437,9 +453,10 @@
       timer.className = 'timer';
       timer.textContent = mmss(rem) + ' left';
       bar.style.width = (100 - rem / (cur.minutes * 600)) + '%';
-      if (rem === 0 && finishing !== cur.num && canWrite) {
+      if (rem === 0 && finishing !== cur.num && canWrite && dueToFinish(cur)) {
         finishing = cur.num;
-        autoFinish(cur.num);
+        // Clear the guard if the write didn't go through, so the next tick tries again.
+        autoFinish(cur.num).then(r => { if (r == null && finishing === cur.num) finishing = null; });
       }
     }
     if (!fromRender && isMine(cur) && cur.status === 'active') {
@@ -464,7 +481,8 @@
 
   $('take').onclick = async () => {
     const b = $('take'); b.disabled = true; b.textContent = 'Getting your number…';
-    unlockAudio(); soundOn = true; syncSound();
+    unlockAudio();
+    if (!soundTouched) { soundOn = true; syncSound(); } // respect a viewer who turned sound off
     const minutes = Math.min(30, Math.max(15, parseInt(dur.value, 10) || 15));
     const res = await takeNumber($('name').value.trim().slice(0, 30), minutes);
     if (res) {
@@ -485,7 +503,7 @@
     b.textContent = soundOn ? 'Sound on' : 'Turn on sound';
     b.classList.toggle('sel', soundOn);
   }
-  $('sound').onclick = () => { unlockAudio(); soundOn = !soundOn; syncSound(); if (soundOn) chime(); };
+  $('sound').onclick = () => { unlockAudio(); soundTouched = true; soundOn = !soundOn; syncSound(); if (soundOn) chime(); };
 
   const resetBtn = $('reset');
   let resetTimer;
@@ -514,6 +532,8 @@
     const user = await window.claude.use('user');
     const can = user ? await user.can('data.write') : null;
     canWrite = can !== false;
+    writeUnknown = can == null;
+    isEditor = user ? !!(await user.canEdit()) : false;
     ref = db.doc('queue/state');
 
     const slow = setTimeout(() => setStatus('Still connecting to the queue…', true), 10000);

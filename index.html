@@ -166,7 +166,10 @@
   const label = t => t.name ? `${t.name} · ${t.minutes} min` : `${t.minutes} min`;
 
   // ---------- actions ----------
+  // Every action re-reads the saved queue first, so a change made in another open tab
+  // isn't overwritten by this tab's older copy.
   function takeNumber(name, minutes) {
+    state = load();
     const t = { num: ++state.lastNum, name: name.trim(), minutes, status: 'waiting' };
     state.tickets.push(t);
     advanceIfFree();
@@ -185,6 +188,7 @@
   }
 
   function start(num) {
+    state = load();
     const t = state.tickets.find(t => t.num === num);
     if (!t || t.status !== 'called') return;
     t.status = 'active';
@@ -193,8 +197,9 @@
   }
 
   function finish(num, status = 'done') {
+    state = load();
     const t = state.tickets.find(t => t.num === num);
-    if (!t) return;
+    if (!t || (t.status !== 'active' && t.status !== 'called')) { render(); return; }
     t.status = status;
     t.endedAt = Date.now();
     advanceIfFree();
@@ -202,6 +207,7 @@
   }
 
   function removeWaiting(num) {
+    state = load();
     state.tickets = state.tickets.filter(t => !(t.num === num && t.status === 'waiting'));
     save();
   }
