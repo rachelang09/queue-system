@@ -1,0 +1,3 @@
+# The shared version only runs on claude.ai, and .claude holds local tooling config.
+shared
+.claude
