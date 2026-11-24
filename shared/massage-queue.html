@@ -1,0 +1,536 @@
+<title>Massage Chair Queue</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap">
+<style>
+  /* Layout: a three-slot ticket board (past · now · next) on top, then "take a number" beside the live waiting list. */
+  :root {
+    --bg: #eef2f1; --surface: #ffffff; --ink: #17211f; --muted: #5c6b68; --line: #d5dfdc;
+    --accent: #1f6f62; --accent-soft: #dcebe7; --on-accent: #ffffff;
+    --ok: #1f8a4c; --warn: #b42318; --dim: #9aa8a5;
+    --display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+    --body: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #0f1615; --surface: #172120; --ink: #e6eeec; --muted: #93a5a1; --line: #26322f;
+    --accent: #5cc2ad; --accent-soft: #1c3330; --on-accent: #0b1513;
+    --ok: #43b77a; --warn: #f2766a; --dim: #5d6e6a; color-scheme: dark; } }
+  :root[data-theme="dark"] {
+    --bg: #0f1615; --surface: #172120; --ink: #e6eeec; --muted: #93a5a1; --line: #26322f;
+    --accent: #5cc2ad; --accent-soft: #1c3330; --on-accent: #0b1513;
+    --ok: #43b77a; --warn: #f2766a; --dim: #5d6e6a; color-scheme: dark; }
+
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 15px; }
+  .wrap {
+    max-width: 1000px; margin: 0 auto; display: grid; gap: 18px;
+    padding-block: 20px 40px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+  h1 { font-family: var(--display); font-size: 1.45rem; margin: 0; text-wrap: balance; }
+  .clock { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .status { color: var(--muted); font-size: .88rem; }
+  .status.err { color: var(--warn); }
+
+  .eyebrow { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .num { font-family: var(--display); font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+
+  .called {
+    background: var(--accent); color: var(--on-accent); border-radius: 14px; padding: 16px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .called .num { font-size: 2.4rem; }
+  .called p { margin: 0; font-size: 1.05rem; flex: 1; min-width: 12em; }
+  .called.mine { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { filter: brightness(1.15); } }
+  @media (prefers-reduced-motion: reduce) { .called.mine { animation: none; } .bar > div { transition: none; } }
+
+  .board { display: grid; grid-template-columns: 1fr 1.7fr 1fr; gap: 14px; }
+  .slot { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; text-align: center; display: grid; gap: 8px; align-content: start; }
+  .slot .num { font-size: 2.8rem; color: var(--dim); }
+  .slot .sub { color: var(--muted); font-size: .88rem; min-height: 1.3em; }
+  .slot.now { border: 2px solid var(--accent); }
+  .slot.now .num { font-size: 4.4rem; color: var(--accent); }
+  .timer { font-family: var(--display); font-size: 1.5rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .timer.small { font-size: 1rem; font-weight: 500; color: var(--muted); font-family: var(--body); }
+  .bar { height: 6px; background: var(--accent-soft); border-radius: 3px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .9s linear; }
+  .actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: grid; gap: 12px; align-content: start; min-width: 0; }
+  .panel h2 { font-family: var(--display); font-size: 1.05rem; margin: 0; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 6px; }
+  input[type=text] { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+  .durs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  button {
+    font: inherit; font-weight: 500; padding: 9px 14px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.sel, button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  button.primary { width: 100%; padding: 12px; font-weight: 600; }
+  button.go { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.danger { color: var(--warn); }
+  button.danger.armed { background: var(--warn); border-color: var(--warn); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+
+  .mine-card { border: 2px dashed var(--accent); background: var(--accent-soft); border-radius: 12px; padding: 14px; text-align: center; display: grid; gap: 4px; }
+  .mine-card .num { font-size: 2.4rem; color: var(--accent); }
+  .mine-card .msg { color: var(--ink); }
+
+  ul.q { list-style: none; margin: 0; padding: 0; }
+  ul.q li { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  ul.q li:last-child { border-bottom: 0; }
+  ul.q .n { font-family: var(--display); font-weight: 700; width: 3.4em; font-variant-numeric: tabular-nums; }
+  ul.q .who { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  ul.q .who small { color: var(--muted); }
+  ul.q .eta { color: var(--muted); font-size: .82rem; text-align: right; font-variant-numeric: tabular-nums; }
+  ul.q .you { font-size: .7rem; font-weight: 600; background: var(--accent); color: var(--on-accent); border-radius: 999px; padding: 1px 7px; margin-left: 6px; }
+  ul.q .x { padding: 3px 9px; font-size: .8rem; }
+  .empty { color: var(--muted); font-style: italic; }
+
+  footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: .85rem; }
+  footer .btns { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  @media (max-width: 720px) {
+    .board { grid-template-columns: 1fr 1fr; }
+    .slot.now { grid-column: 1 / -1; order: -1; }
+    .cols { grid-template-columns: 1fr; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Massage Chair Queue</h1>
+    <span class="clock" id="clock"></span>
+  </header>
+
+  <div class="called" id="called" hidden role="alert"></div>
+
+  <section class="board" aria-label="Queue board">
+    <div class="slot">
+      <span class="eyebrow">Past</span>
+      <span class="num" id="pastNum">—</span>
+      <span class="sub" id="pastSub"></span>
+    </div>
+    <div class="slot now">
+      <span class="eyebrow">Now serving</span>
+      <span class="num" id="curNum">—</span>
+      <span class="sub" id="curSub">Chair is free</span>
+      <span class="timer" id="curTimer"></span>
+      <div class="bar"><div id="curBar"></div></div>
+      <div class="actions" id="curActions"></div>
+    </div>
+    <div class="slot">
+      <span class="eyebrow">Next</span>
+      <span class="num" id="nextNum">—</span>
+      <span class="sub" id="nextSub"></span>
+    </div>
+  </section>
+
+  <section class="cols">
+    <div class="panel">
+      <h2>Take a number</h2>
+      <div class="mine-card" id="mine" hidden></div>
+      <div>
+        <label for="name">Name (optional)</label>
+        <input type="text" id="name" maxlength="30" placeholder="So others know who's up" autocomplete="off">
+      </div>
+      <div>
+        <label for="dur">How long will you use the chair? <strong id="durLabel">15 min</strong></label>
+        <div class="durs" id="durs"></div>
+        <input type="range" id="dur" min="15" max="30" step="1" value="15">
+      </div>
+      <button class="primary" id="take" disabled>Get my number</button>
+    </div>
+
+    <div class="panel">
+      <h2>Waiting list</h2>
+      <ul class="q" id="list"><li class="empty">Loading the queue…</li></ul>
+    </div>
+  </section>
+
+  <footer>
+    <span class="status" id="status">Connecting…</span>
+    <span class="btns">
+      <button id="sound">Turn on sound</button>
+      <button class="danger" id="reset" disabled>Reset queue</button>
+    </span>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const GRACE_MIN = 3;          // minutes before a called no-show can be skipped
+  const KEEP_FINISHED = 40;     // finished tickets kept in the record
+  const MY_KEY = 'massageQueue.mine';
+  const tabId = Math.random().toString(36).slice(2);
+  const $ = id => document.getElementById(id);
+
+  let db = null, ref = null, state = null, canWrite = false;
+
+  // ---------- helpers ----------
+  const fmt = n => '#' + String(n).padStart(3, '0');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const clockTime = ms => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const mmss = ms => { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  const blank = () => ({ epoch: Math.random().toString(36).slice(2, 8), lastNum: 0, tickets: [] });
+
+  const tickets = () => (state && state.tickets) || [];
+  const inChair = () => tickets().find(t => t.status === 'active' || t.status === 'called');
+  const waiting = () => tickets().filter(t => t.status === 'waiting').sort((a, b) => a.num - b.num);
+  const lastFinished = () => tickets().filter(t => t.status === 'done' || t.status === 'skipped')
+    .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))[0];
+  const remaining = t => Math.max(0, t.startedAt + t.minutes * 60000 - Date.now());
+  const who = t => t.name ? t.name : 'Guest';
+
+  // Tickets this browser took (per-device memory, tied to the current queue epoch).
+  function myNums() {
+    try {
+      const m = JSON.parse(localStorage.getItem(MY_KEY) || 'null');
+      return m && state && m.epoch === state.epoch ? m.nums : [];
+    } catch { return []; }
+  }
+  function addMine(num) {
+    try { localStorage.setItem(MY_KEY, JSON.stringify({ epoch: state.epoch, nums: [...myNums(), num] })); } catch {}
+  }
+  const isMine = t => t && myNums().includes(t.num);
+
+  // Start time estimates for everyone waiting.
+  function etas() {
+    const cur = inChair();
+    let free = Date.now();
+    if (cur) free += cur.status === 'active' ? remaining(cur) : cur.minutes * 60000;
+    const out = {};
+    for (const t of waiting()) { out[t.num] = free; free += t.minutes * 60000; }
+    return out;
+  }
+
+  // ---------- shared writes: one writer at a time via a short lease ----------
+  function advance(s) {
+    if (s.tickets.some(t => t.status === 'active' || t.status === 'called')) return;
+    const nxt = s.tickets.filter(t => t.status === 'waiting').sort((a, b) => a.num - b.num)[0];
+    if (nxt) { nxt.status = 'called'; nxt.calledAt = Date.now(); }
+  }
+  function prune(s) {
+    const fin = s.tickets.filter(t => t.status === 'done' || t.status === 'skipped')
+      .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+    const drop = new Set(fin.slice(KEEP_FINISHED).map(t => t.num));
+    s.tickets = s.tickets.filter(t => !drop.has(t.num));
+  }
+
+  async function mutate(fn) {
+    if (!ref || !canWrite) return null;
+    for (let i = 0; i < 12; i++) {
+      let lease;
+      try { lease = await ref.acquire({ holder: tabId, ttlMs: 2000 }); }
+      catch (e) { setStatus(errText(e), true); return null; }
+      if (!lease.acquired) { await sleep(250 + Math.random() * 400); continue; }
+      try {
+        const snap = await ref.get();
+        const s = snap.exists ? structuredClone(snap.data()) : blank();
+        s.tickets = s.tickets || [];
+        const result = fn(s);
+        if (result === false) return null;
+        advance(s); prune(s);
+        await ref.set(s);
+        return result;
+      } catch (e) {
+        if (e && e.code === 'invalid_argument') { canWrite = false; render(); setStatus('You can view the queue but not change it. Ask the owner for Contributor access.', true); }
+        else setStatus(errText(e), true);
+        return null;
+      }
+    }
+    setStatus('The queue is busy. Try again in a moment.', true);
+    return null;
+  }
+  const errText = e => e && e.code === 'quota_exceeded' ? 'The queue storage is full. Reset the queue to continue.'
+    : 'Could not reach the queue. Check your connection and try again.';
+
+  const takeNumber = (name, minutes) => mutate(s => {
+    const t = { num: ++s.lastNum, name, minutes, status: 'waiting' };
+    s.tickets.push(t);
+    return { num: t.num, epoch: s.epoch };
+  });
+  const startSession = num => mutate(s => {
+    const t = s.tickets.find(t => t.num === num);
+    if (!t || t.status !== 'called') return false;
+    t.status = 'active'; t.startedAt = Date.now(); return true;
+  });
+  const finishSession = (num, status) => mutate(s => {
+    const t = s.tickets.find(t => t.num === num);
+    if (!t || (t.status !== 'active' && t.status !== 'called')) return false;
+    t.status = status; t.endedAt = Date.now(); return true;
+  });
+  const autoFinish = num => mutate(s => {
+    const t = s.tickets.find(t => t.num === num);
+    if (!t || t.status !== 'active' || remaining(t) > 0) return false;
+    t.status = 'done'; t.endedAt = t.startedAt + t.minutes * 60000; return true;
+  });
+  const leave = num => mutate(s => {
+    const before = s.tickets.length;
+    s.tickets = s.tickets.filter(t => !(t.num === num && t.status === 'waiting'));
+    return s.tickets.length !== before;
+  });
+  const resetQueue = () => mutate(s => { Object.assign(s, blank()); return true; });
+
+  // ---------- alerts ----------
+  let audio = null, soundOn = false, lastCalled = undefined;
+  function unlockAudio() {
+    try { audio = audio || new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch {}
+  }
+  function chime(times = 1) {
+    if (!soundOn || !audio) return;
+    try {
+      for (let r = 0; r < times; r++) [660, 880, 990].forEach((f, i) => {
+        const o = audio.createOscillator(), g = audio.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        const t0 = audio.currentTime + r * 1.1 + i * 0.22;
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.3, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+        o.connect(g).connect(audio.destination); o.start(t0); o.stop(t0 + 0.65);
+      });
+    } catch {}
+  }
+  function onCalledChange(cur) {
+    const num = cur && cur.status === 'called' ? cur.num : null;
+    if (lastCalled === undefined) { lastCalled = num; return; } // first load: no alert
+    if (num === lastCalled) return;
+    lastCalled = num;
+    if (num == null) return;
+    const mine = isMine(cur);
+    chime(mine ? 3 : 1);
+    if (mine) {
+      try { navigator.vibrate && navigator.vibrate([300, 150, 300, 150, 300]); } catch {}
+      flashTitle(`${fmt(num)} — your turn!`);
+    }
+  }
+  let flashTimer = null;
+  function flashTitle(text) {
+    const base = 'Massage Chair Queue';
+    clearInterval(flashTimer);
+    let on = false, n = 0;
+    flashTimer = setInterval(() => {
+      document.title = (on = !on) ? text : base;
+      if (++n > 30) { clearInterval(flashTimer); document.title = base; }
+    }, 1000);
+  }
+
+  // ---------- rendering ----------
+  function btn(text, cls, fn) {
+    const b = document.createElement('button');
+    b.textContent = text; if (cls) b.className = cls;
+    b.disabled = !canWrite;
+    b.onclick = async () => { b.disabled = true; await fn(); };
+    return b;
+  }
+  // Two-tap button for destructive actions (dialogs are not available in the viewer).
+  function confirmBtn(text, armedText, fn) {
+    const b = document.createElement('button');
+    b.className = 'danger'; b.textContent = text; b.disabled = !canWrite;
+    let timer;
+    b.onclick = async () => {
+      if (!b.classList.contains('armed')) {
+        b.classList.add('armed'); b.textContent = armedText;
+        timer = setTimeout(() => { b.classList.remove('armed'); b.textContent = text; }, 4000);
+        return;
+      }
+      clearTimeout(timer); b.disabled = true; await fn();
+    };
+    return b;
+  }
+  function setStatus(text, err) { const s = $('status'); s.textContent = text; s.classList.toggle('err', !!err); }
+
+  function render() {
+    const past = lastFinished(), cur = inChair(), q = waiting(), nxt = q[0], eta = etas();
+
+    $('pastNum').textContent = past ? fmt(past.num) : '—';
+    $('pastSub').textContent = past ? (past.status === 'skipped' ? 'No-show' : 'Finished ' + clockTime(past.endedAt)) : '';
+    $('curNum').textContent = cur ? fmt(cur.num) : '—';
+    $('curSub').textContent = cur ? `${who(cur)} · ${cur.minutes} min` : (state ? 'Chair is free' : '');
+    $('nextNum').textContent = nxt ? fmt(nxt.num) : '—';
+    $('nextSub').textContent = nxt ? `${who(nxt)} · ${nxt.minutes} min · ~${clockTime(eta[nxt.num])}` : (state ? 'No one waiting' : '');
+
+    const acts = $('curActions'); acts.replaceChildren();
+    if (cur && cur.status === 'called') {
+      acts.append(btn("I'm here, start timer", 'go', () => startSession(cur.num)));
+      const skip = confirmBtn('Skip (no-show)', 'Tap again to skip', () => finishSession(cur.num, 'skipped'));
+      skip.id = 'skipBtn'; skip.title = `Available ${GRACE_MIN} min after the number is called`;
+      acts.append(skip);
+    } else if (cur) {
+      acts.append(btn('End session early', '', () => finishSession(cur.num, 'done')));
+    }
+
+    // Called banner
+    const banner = $('called');
+    if (cur && cur.status === 'called') {
+      const mine = isMine(cur);
+      banner.replaceChildren();
+      const n = document.createElement('span'); n.className = 'num'; n.textContent = fmt(cur.num);
+      const p = document.createElement('p');
+      p.textContent = mine ? "It's your turn. Please go to the massage chair and tap “I'm here” to start your timer."
+        : `${who(cur)}, please proceed to the massage chair.`;
+      banner.append(n, p);
+      banner.classList.toggle('mine', mine);
+      banner.hidden = false;
+    } else banner.hidden = true;
+
+    // My ticket card
+    const mine = myNums().map(n => tickets().find(t => t.num === n)).filter(t => t && t.status !== 'done' && t.status !== 'skipped');
+    const card = $('mine');
+    if (mine.length) {
+      const t = mine[0];
+      card.replaceChildren();
+      const l = document.createElement('span'); l.className = 'eyebrow'; l.textContent = 'Your number';
+      const n = document.createElement('span'); n.className = 'num'; n.textContent = fmt(t.num);
+      const m = document.createElement('span'); m.className = 'msg';
+      if (t.status === 'called') m.textContent = "You're up! Head to the chair now.";
+      else if (t.status === 'active') m.textContent = `Enjoy your session · ${mmss(remaining(t))} left`;
+      else {
+        const ahead = q.filter(w => w.num < t.num).length + (cur ? 1 : 0);
+        m.textContent = `${ahead} ahead of you · starts around ${clockTime(eta[t.num])}. Keep this page open; it will chime when it's your turn.`;
+      }
+      card.append(l, n, m);
+      card.hidden = false;
+    } else card.hidden = true;
+
+    // Waiting list
+    const ul = $('list'); ul.replaceChildren();
+    if (!state) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'Loading the queue…'; ul.append(li); }
+    else if (!q.length) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = 'No one waiting'; ul.append(li); }
+    q.forEach((t, i) => {
+      const li = document.createElement('li');
+      const n = document.createElement('span'); n.className = 'n'; n.textContent = fmt(t.num);
+      const w = document.createElement('span'); w.className = 'who'; w.textContent = who(t) + ' ';
+      const sm = document.createElement('small'); sm.textContent = `· ${t.minutes} min`; w.append(sm);
+      if (isMine(t)) { const y = document.createElement('span'); y.className = 'you'; y.textContent = 'You'; w.append(y); }
+      const e = document.createElement('span'); e.className = 'eta';
+      e.textContent = (i === 0 ? 'Next' : `${i} ahead`) + ' · ~' + clockTime(eta[t.num]);
+      li.append(n, w, e, confirmBtn('Leave', 'Remove?', () => leave(t.num)));
+      ul.append(li);
+    });
+
+    $('take').disabled = !canWrite || !state;
+    $('reset').disabled = !canWrite || !state;
+    tick(true);
+  }
+
+  let finishing = null;
+  function tick(fromRender) {
+    $('clock').textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    const cur = inChair(), timer = $('curTimer'), bar = $('curBar');
+    if (!cur) { timer.textContent = ''; bar.style.width = '0'; return; }
+    if (cur.status === 'called') {
+      timer.className = 'timer small';
+      timer.textContent = 'Waiting for arrival · ' + mmss(Date.now() - cur.calledAt);
+      bar.style.width = '0';
+      const skip = $('skipBtn');
+      if (skip && canWrite && !skip.classList.contains('armed')) skip.disabled = Date.now() - cur.calledAt < GRACE_MIN * 60000;
+    } else {
+      const rem = remaining(cur);
+      timer.className = 'timer';
+      timer.textContent = mmss(rem) + ' left';
+      bar.style.width = (100 - rem / (cur.minutes * 600)) + '%';
+      if (rem === 0 && finishing !== cur.num && canWrite) {
+        finishing = cur.num;
+        autoFinish(cur.num);
+      }
+    }
+    if (!fromRender && isMine(cur) && cur.status === 'active') {
+      const m = document.querySelector('#mine .msg');
+      if (m) m.textContent = `Enjoy your session · ${mmss(remaining(cur))} left`;
+    }
+  }
+
+  // ---------- form ----------
+  const dur = $('dur'), durs = $('durs');
+  [15, 20, 25, 30].forEach(m => {
+    const b = document.createElement('button'); b.type = 'button';
+    b.textContent = m + ' min'; b.dataset.m = m;
+    b.onclick = () => { dur.value = m; syncDur(); };
+    durs.append(b);
+  });
+  function syncDur() {
+    $('durLabel').textContent = dur.value + ' min';
+    durs.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.m === dur.value));
+  }
+  dur.oninput = syncDur; syncDur();
+
+  $('take').onclick = async () => {
+    const b = $('take'); b.disabled = true; b.textContent = 'Getting your number…';
+    unlockAudio(); soundOn = true; syncSound();
+    const minutes = Math.min(30, Math.max(15, parseInt(dur.value, 10) || 15));
+    const res = await takeNumber($('name').value.trim().slice(0, 30), minutes);
+    if (res) {
+      try {
+        const prev = JSON.parse(localStorage.getItem(MY_KEY) || 'null');
+        const nums = prev && prev.epoch === res.epoch ? prev.nums : [];
+        localStorage.setItem(MY_KEY, JSON.stringify({ epoch: res.epoch, nums: [...nums, res.num] }));
+      } catch {}
+      $('name').value = '';
+      setStatus(`You're ${fmt(res.num)}. Keep this page open to be alerted.`);
+    }
+    b.textContent = 'Get my number';
+    render();
+  };
+
+  function syncSound() {
+    const b = $('sound');
+    b.textContent = soundOn ? 'Sound on' : 'Turn on sound';
+    b.classList.toggle('sel', soundOn);
+  }
+  $('sound').onclick = () => { unlockAudio(); soundOn = !soundOn; syncSound(); if (soundOn) chime(); };
+
+  const resetBtn = $('reset');
+  let resetTimer;
+  resetBtn.onclick = async () => {
+    if (!resetBtn.classList.contains('armed')) {
+      resetBtn.classList.add('armed'); resetBtn.textContent = 'Tap again to clear everyone';
+      resetTimer = setTimeout(() => { resetBtn.classList.remove('armed'); resetBtn.textContent = 'Reset queue'; }, 4000);
+      return;
+    }
+    clearTimeout(resetTimer); resetBtn.classList.remove('armed'); resetBtn.textContent = 'Reset queue';
+    resetBtn.disabled = true;
+    if (await resetQueue()) setStatus('Queue cleared. Numbers start again from #001.');
+    render();
+  };
+
+  setInterval(() => tick(false), 1000);
+  render();
+
+  // ---------- connect ----------
+  (async () => {
+    db = window.claude && window.claude.use ? await window.claude.use('db') : null;
+    if (!db) {
+      setStatus('Open this page on claude.ai while signed in to join the live queue.', true);
+      return;
+    }
+    const user = await window.claude.use('user');
+    const can = user ? await user.can('data.write') : null;
+    canWrite = can !== false;
+    ref = db.doc('queue/state');
+
+    const slow = setTimeout(() => setStatus('Still connecting to the queue…', true), 10000);
+    ref.onSnapshot(snap => {
+      if (!snap.metadata.fromCache) clearTimeout(slow);
+      state = snap.exists ? snap.data() : { epoch: '', lastNum: 0, tickets: [] };
+      if (!snap.metadata.fromCache) {
+        const s = $('status');
+        if (s.textContent.startsWith('Connecting') || s.textContent.startsWith('Still connecting'))
+          setStatus(canWrite ? 'Live · updates on every device with this page open.' : 'Live · view only.');
+      }
+      onCalledChange(inChair());
+      render();
+    }, e => { clearTimeout(slow); setStatus(e && e.code === 'revoked' ? 'The queue is no longer available here.' : 'Lost the connection to the queue. Reload the page to reconnect.', true); });
+  })();
+
+  // Unlock audio on any first interaction so later chimes can play.
+  document.addEventListener('pointerdown', unlockAudio, { once: true });
+})();
+</script>

@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Massage Chair Queue</title>
+<style>
+  :root {
+    --bg: #f4f1ec; --card: #fff; --ink: #2b2622; --muted: #8a8079;
+    --accent: #6b4f3a; --accent-soft: #efe6dd; --ok: #2f7d4f; --warn: #b5532f;
+    --line: #e4ddd5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--ink);
+  }
+  header { padding: 20px 24px 8px; display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  header h1 { margin: 0; font-size: 1.4rem; }
+  header .clock { color: var(--muted); font-variant-numeric: tabular-nums; }
+  main { max-width: 1000px; margin: 0 auto; padding: 8px 24px 40px; display: grid; gap: 20px; }
+
+  .board { display: grid; grid-template-columns: 1fr 1.6fr 1fr; gap: 16px; }
+  .slot { background: var(--card); border-radius: 16px; padding: 18px; text-align: center; border: 1px solid var(--line); }
+  .slot h2 { margin: 0 0 8px; font-size: .8rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .slot .num { font-size: 3rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .slot .sub { color: var(--muted); font-size: .9rem; min-height: 1.3em; margin-top: 4px; }
+  .slot.current { border: 2px solid var(--accent); }
+  .slot.current .num { font-size: 4.5rem; color: var(--accent); }
+  .slot.past .num, .slot.next .num { color: #a39890; }
+  .timer { font-size: 1.6rem; font-variant-numeric: tabular-nums; margin-top: 6px; font-weight: 600; }
+  .bar { height: 6px; background: var(--accent-soft); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .5s linear; }
+  .actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 12px; }
+
+  .called {
+    display: none; background: var(--ok); color: #fff; border-radius: 16px; padding: 18px 22px;
+    text-align: center; font-size: 1.3rem; animation: pulse 1.4s ease-in-out infinite;
+  }
+  .called.show { display: block; }
+  .called strong { font-size: 1.8rem; }
+  @keyframes pulse { 50% { opacity: .8; } }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: var(--card); border-radius: 16px; padding: 18px; border: 1px solid var(--line); }
+  .panel h3 { margin: 0 0 12px; font-size: 1rem; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text] { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); font: inherit; }
+  .durations { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .durations button { padding: 10px 0; }
+  .durations button.sel { background: var(--accent); color: #fff; border-color: var(--accent); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  button {
+    font: inherit; padding: 10px 16px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); width: 100%; margin-top: 14px; font-weight: 600; }
+  button.go { background: var(--ok); color: #fff; border-color: var(--ok); }
+  button.danger { color: var(--warn); }
+  button:disabled { opacity: .45; cursor: default; }
+
+  .ticket {
+    display: none; margin-top: 14px; text-align: center; border: 2px dashed var(--accent);
+    border-radius: 12px; padding: 14px; background: var(--accent-soft);
+  }
+  .ticket.show { display: block; }
+  .ticket .big { font-size: 2.6rem; font-weight: 700; color: var(--accent); }
+
+  ul.queue { list-style: none; padding: 0; margin: 0; }
+  ul.queue li { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); gap: 8px; }
+  ul.queue li:last-child { border-bottom: 0; }
+  ul.queue .n { font-weight: 700; width: 3.2em; font-variant-numeric: tabular-nums; }
+  ul.queue .who { flex: 1; }
+  ul.queue .eta { color: var(--muted); font-size: .85rem; text-align: right; }
+  ul.queue .x { padding: 2px 8px; font-size: .8rem; }
+  .empty { color: var(--muted); font-style: italic; }
+  .foot { display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: .85rem; flex-wrap: wrap; gap: 8px; }
+
+  @media (max-width: 720px) {
+    .board, .grid2 { grid-template-columns: 1fr; }
+    .slot.current { order: -1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>💆 Massage Chair Queue</h1>
+  <div class="clock" id="clock"></div>
+</header>
+
+<main>
+  <div class="called" id="calledBanner" role="alert"></div>
+
+  <section class="board">
+    <div class="slot past">
+      <h2>Past</h2>
+      <div class="num" id="pastNum">—</div>
+      <div class="sub" id="pastSub"></div>
+    </div>
+    <div class="slot current">
+      <h2>Now serving</h2>
+      <div class="num" id="curNum">—</div>
+      <div class="sub" id="curSub">Chair is free</div>
+      <div class="timer" id="curTimer"></div>
+      <div class="bar"><div id="curBar"></div></div>
+      <div class="actions" id="curActions"></div>
+    </div>
+    <div class="slot next">
+      <h2>Next</h2>
+      <div class="num" id="nextNum">—</div>
+      <div class="sub" id="nextSub"></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel">
+      <h3>Take a number</h3>
+      <label for="name">Name (optional)</label>
+      <input type="text" id="name" maxlength="30" placeholder="e.g. Alex">
+      <label>How long will you use the chair? <strong id="durLabel">15 min</strong></label>
+      <div class="durations" id="durQuick"></div>
+      <input type="range" id="dur" min="15" max="30" step="1" value="15" aria-label="Duration in minutes">
+      <button class="primary" id="takeBtn">Get my number</button>
+      <div class="ticket" id="ticket"></div>
+    </div>
+
+    <div class="panel">
+      <h3>Waiting list</h3>
+      <ul class="queue" id="queueList"></ul>
+    </div>
+  </section>
+
+  <div class="foot">
+    <span id="notifyStatus"></span>
+    <span>
+      <button id="notifyBtn">Enable alerts</button>
+      <button class="danger" id="resetBtn">Reset queue</button>
+    </span>
+  </div>
+</main>
+
+<script>
+(() => {
+  const KEY = 'massageQueue.v1';
+  const GRACE_MIN = 3; // minutes a called person has to arrive before they can be skipped
+
+  // ---------- state ----------
+  // tickets: {num, name, minutes, status: waiting|called|active|done|skipped, calledAt, startedAt, endedAt}
+  const blank = () => ({ lastNum: 0, tickets: [] });
+  let state = load();
+
+  function load() {
+    try { return JSON.parse(localStorage.getItem(KEY)) || blank(); } catch { return blank(); }
+  }
+  function save() { localStorage.setItem(KEY, JSON.stringify(state)); render(); }
+  window.addEventListener('storage', e => { if (e.key === KEY) { state = load(); render(); } });
+
+  const byStatus = s => state.tickets.filter(t => t.status === s);
+  const inChair = () => state.tickets.find(t => t.status === 'active' || t.status === 'called');
+  const waiting = () => byStatus('waiting').sort((a, b) => a.num - b.num);
+  const lastFinished = () => state.tickets
+    .filter(t => t.status === 'done' || t.status === 'skipped')
+    .sort((a, b) => b.endedAt - a.endedAt)[0];
+  const fmtNum = n => '#' + String(n).padStart(3, '0');
+  const label = t => t.name ? `${t.name} · ${t.minutes} min` : `${t.minutes} min`;
+
+  // ---------- actions ----------
+  function takeNumber(name, minutes) {
+    const t = { num: ++state.lastNum, name: name.trim(), minutes, status: 'waiting' };
+    state.tickets.push(t);
+    advanceIfFree();
+    save();
+    return t;
+  }
+
+  // If the chair is free, call the next person in line.
+  function advanceIfFree() {
+    if (inChair()) return;
+    const nxt = waiting()[0];
+    if (!nxt) return;
+    nxt.status = 'called';
+    nxt.calledAt = Date.now();
+    announce(nxt);
+  }
+
+  function start(num) {
+    const t = state.tickets.find(t => t.num === num);
+    if (!t || t.status !== 'called') return;
+    t.status = 'active';
+    t.startedAt = Date.now();
+    save();
+  }
+
+  function finish(num, status = 'done') {
+    const t = state.tickets.find(t => t.num === num);
+    if (!t) return;
+    t.status = status;
+    t.endedAt = Date.now();
+    advanceIfFree();
+    save();
+  }
+
+  function removeWaiting(num) {
+    state.tickets = state.tickets.filter(t => !(t.num === num && t.status === 'waiting'));
+    save();
+  }
+
+  // ---------- notifications ----------
+  let lastAnnounced = null;
+  function announce(t) {
+    if (lastAnnounced === t.num) return;
+    lastAnnounced = t.num;
+    chime();
+    const msg = `Number ${t.num}${t.name ? ' (' + t.name + ')' : ''}, you may now proceed to the massage chair.`;
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try { new Notification('Massage chair is ready', { body: msg, tag: 'chair-' + t.num }); } catch {}
+    }
+    if ('speechSynthesis' in window) {
+      try { speechSynthesis.speak(new SpeechSynthesisUtterance(msg)); } catch {}
+    }
+  }
+
+  let audioCtx;
+  function chime() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      [660, 880, 990].forEach((f, i) => {
+        const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+        o.frequency.value = f; o.type = 'sine';
+        const t0 = audioCtx.currentTime + i * 0.25;
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.3, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+        o.connect(g).connect(audioCtx.destination);
+        o.start(t0); o.stop(t0 + 0.65);
+      });
+    } catch {}
+  }
+
+  // ---------- timing ----------
+  const remainingMs = t => Math.max(0, t.startedAt + t.minutes * 60000 - Date.now());
+  const mmss = ms => {
+    const s = Math.ceil(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+  const clockTime = ms => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+  // Estimated start time for each waiting ticket.
+  function etas() {
+    const cur = inChair();
+    let free = Date.now();
+    if (cur) free = cur.status === 'active'
+      ? Date.now() + remainingMs(cur)
+      : Date.now() + cur.minutes * 60000; // called but not yet started
+    const out = {};
+    for (const t of waiting()) { out[t.num] = free; free += t.minutes * 60000; }
+    return out;
+  }
+
+  function tick() {
+    // auto-finish sessions whose time is up
+    const cur = inChair();
+    if (cur && cur.status === 'active' && remainingMs(cur) === 0) { finish(cur.num); return; }
+    document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+    renderCurrentTimer();
+  }
+
+  // ---------- rendering ----------
+  const $ = id => document.getElementById(id);
+
+  function renderCurrentTimer() {
+    const cur = inChair();
+    const timer = $('curTimer'), bar = $('curBar');
+    if (!cur) { timer.textContent = ''; bar.style.width = '0'; return; }
+    if (cur.status === 'called') {
+      const waited = Date.now() - cur.calledAt;
+      timer.textContent = 'Waiting for arrival · ' + mmss(waited);
+      timer.style.fontSize = '1rem';
+      bar.style.width = '0';
+    } else {
+      const rem = remainingMs(cur);
+      timer.textContent = mmss(rem) + ' left';
+      timer.style.fontSize = '';
+      bar.style.width = (100 - rem / (cur.minutes * 600)) + '%';
+    }
+    // allow skipping a no-show after the grace period
+    const skip = $('skipBtn');
+    if (skip) skip.disabled = Date.now() - cur.calledAt < GRACE_MIN * 60000;
+  }
+
+  function render() {
+    const past = lastFinished(), cur = inChair(), q = waiting(), nxt = q[0];
+
+    $('pastNum').textContent = past ? fmtNum(past.num) : '—';
+    $('pastSub').textContent = past ? (past.status === 'skipped' ? 'No-show' : 'Done ' + clockTime(past.endedAt)) : '';
+
+    $('curNum').textContent = cur ? fmtNum(cur.num) : '—';
+    $('curSub').textContent = cur ? label(cur) : 'Chair is free';
+
+    const etaMap = etas();
+    $('nextNum').textContent = nxt ? fmtNum(nxt.num) : '—';
+    $('nextSub').textContent = nxt ? `${label(nxt)} · ~${clockTime(etaMap[nxt.num])}` : 'No one waiting';
+
+    const acts = $('curActions');
+    acts.innerHTML = '';
+    if (cur && cur.status === 'called') {
+      acts.append(btn("I'm here — start", 'go', () => start(cur.num)));
+      const s = btn('Skip (no-show)', 'danger', () => finish(cur.num, 'skipped'));
+      s.id = 'skipBtn'; s.title = `Available ${GRACE_MIN} min after being called`;
+      acts.append(s);
+    } else if (cur) {
+      acts.append(btn('End session early', '', () => finish(cur.num)));
+    }
+
+    const banner = $('calledBanner');
+    if (cur && cur.status === 'called') {
+      banner.innerHTML = `<strong>${fmtNum(cur.num)}</strong>${cur.name ? ' · ' + esc(cur.name) : ''}<br>Please proceed to the massage chair 💆`;
+      banner.classList.add('show');
+      announce(cur);
+    } else banner.classList.remove('show');
+
+    const ul = $('queueList');
+    ul.innerHTML = '';
+    if (!q.length) ul.innerHTML = '<li class="empty">No one waiting</li>';
+    q.forEach((t, i) => {
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="n">${fmtNum(t.num)}</span>
+        <span class="who">${esc(t.name || 'Guest')} <span style="color:var(--muted)">· ${t.minutes} min</span></span>
+        <span class="eta">${i === 0 ? 'Next' : `${i} ahead`}<br>~${clockTime(etaMap[t.num])}</span>`;
+      const x = btn('✕', 'x', () => { if (confirm(`Remove ${fmtNum(t.num)} from the queue?`)) removeWaiting(t.num); });
+      x.title = 'Leave queue';
+      li.append(x);
+      ul.append(li);
+    });
+
+    renderCurrentTimer();
+  }
+
+  function btn(text, cls, fn) {
+    const b = document.createElement('button');
+    b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b;
+  }
+  const esc = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // ---------- form ----------
+  const dur = $('dur');
+  const quick = $('durQuick');
+  [15, 20, 25, 30].forEach(m => {
+    const b = btn(m + ' min', '', () => { dur.value = m; syncDur(); });
+    b.dataset.m = m; quick.append(b);
+  });
+  function syncDur() {
+    $('durLabel').textContent = dur.value + ' min';
+    quick.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.m === dur.value));
+  }
+  dur.oninput = syncDur; syncDur();
+
+  $('takeBtn').onclick = () => {
+    const minutes = Math.min(30, Math.max(15, parseInt(dur.value, 10)));
+    const t = takeNumber($('name').value, minutes);
+    const ahead = waiting().filter(w => w.num < t.num).length + (inChair() && inChair().num !== t.num ? 1 : 0);
+    $('ticket').innerHTML = `Your number is<div class="big">${fmtNum(t.num)}</div>` +
+      (t.status === 'called' ? 'The chair is free — go ahead!' : `${ahead} ahead of you · est. start ~${clockTime(etas()[t.num])}`);
+    $('ticket').classList.add('show');
+    $('name').value = '';
+    // warm up audio on a user gesture so later chimes are allowed to play
+    chime.warm || (chime.warm = true, audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)());
+  };
+
+  // ---------- notification permission + reset ----------
+  function syncNotify() {
+    const s = $('notifyStatus'), b = $('notifyBtn');
+    if (!('Notification' in window)) { s.textContent = 'Desktop alerts not supported — sound & banner only.'; b.hidden = true; return; }
+    if (Notification.permission === 'granted') { s.textContent = '🔔 Alerts on — sound, voice and desktop notification.'; b.hidden = true; }
+    else if (Notification.permission === 'denied') { s.textContent = 'Desktop alerts blocked in browser settings — sound & banner only.'; b.hidden = true; }
+    else s.textContent = 'Turn on alerts so the next person is notified even if this tab is in the background.';
+  }
+  $('notifyBtn').onclick = async () => {
+    try { await Notification.requestPermission(); } catch {}
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    syncNotify();
+  };
+  $('resetBtn').onclick = () => {
+    if (confirm('Clear all numbers and start again from #001?')) { state = blank(); lastAnnounced = null; save(); $('ticket').classList.remove('show'); }
+  };
+
+  syncNotify();
+  render();
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
+</body>
+</html>
